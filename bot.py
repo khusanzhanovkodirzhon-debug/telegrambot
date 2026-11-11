@@ -28,13 +28,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 # Можно указать несколько моделей через запятую: если первая перегружена
 # или недоступна, бот автоматически попробует следующую.
-DEFAULT_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash"
+DEFAULT_MODELS = (
+    "gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash,"
+    "gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+)
 MODEL_TIMEOUT = 60  # секунд ждём одну модель, потом пробуем следующую
 GEMINI_MODELS = [
     m.strip() for m in os.getenv("GEMINI_MODEL", DEFAULT_MODELS).split(",") if m.strip()
 ]
 # Ошибки, при которых стоит попробовать другую модель
-FALLBACK_CODES = {404, 429, 500, 503}
+FALLBACK_CODES = {404, 429, 500, 502, 503, 504}
 HISTORY_MESSAGES = 20  # сколько последних сообщений бот помнит в диалоге
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
@@ -122,6 +125,11 @@ TEXTS = {
         "kk": "Кешіріңіз, қате шықты. Қайталап көріңіз.",
         "uz": "Kechirasiz, xatolik yuz berdi. Qaytadan urinib ko'ring.",
     },
+    "rude": {
+        "ru": "Давай общаться вежливо 🙂 Я помогаю только по физике — задай вопрос, и я объясню.",
+        "kk": "Сыпайы сөйлесейік 🙂 Мен тек физика бойынша көмектесемін — сұрағыңды қой, түсіндіріп берейін.",
+        "uz": "Keling, odob bilan gaplashaylik 🙂 Men faqat fizika bo'yicha yordam beraman — savolingni ber, tushuntirib beraman.",
+    },
     "too_big": {
         "ru": "Файл слишком большой (больше 20 МБ). Пришлите, пожалуйста, фото поменьше.",
         "kk": "Файл тым үлкен (20 МБ-тан артық). Кішірек сурет жіберіңізші.",
@@ -179,6 +187,21 @@ async def send_pretty(message: Message, text: str, keyboard=None) -> None:
         await message.answer(strip_html(html_text), reply_markup=keyboard)
 
 
+class ContentBlocked(Exception):
+    """Gemini заблокировал сообщение фильтром безопасности (мат, оскорбления)."""
+
+
+def is_blocked(response) -> bool:
+    feedback = getattr(response, "prompt_feedback", None)
+    if feedback is not None and getattr(feedback, "block_reason", None):
+        return True
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        reason = str(getattr(candidates[0], "finish_reason", "") or "")
+        return any(word in reason for word in ("SAFETY", "PROHIBITED", "BLOCKLIST"))
+    return False
+
+
 async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -> str:
     """Отправляет вопрос в Gemini вместе с историей диалога."""
     past = history[user_id]
@@ -207,6 +230,8 @@ async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -
     else:
         raise last_error  # все модели не сработали
 
+    if is_blocked(response):
+        raise ContentBlocked()
     answer = latex_to_unicode(response.text or "").strip()
     if answer:
         # В историю кладём только текст (без фото/аудио), чтобы экономить память
@@ -219,6 +244,10 @@ async def answer_student(message: Message, parts: list[types.Part], history_note
     try:
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             answer = await ask_gemini(message.from_user.id, parts, history_note)
+    except ContentBlocked:
+        logging.info("Сообщение заблокировано фильтром Gemini")
+        await message.answer(t("rude", message))
+        return
     except asyncio.TimeoutError:
         logging.error("Ни одна модель не ответила вовремя")
         await message.answer(t("busy", message))
