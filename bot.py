@@ -11,6 +11,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.chat_action import ChatActionSender
 from dotenv import load_dotenv
 from google import genai
@@ -18,6 +19,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 import school_info
+from formatting import latex_to_unicode, strip_html, to_telegram_html
 from prompts import LINKS_MARKER, build_system_prompt
 
 load_dotenv()
@@ -120,6 +122,11 @@ TEXTS = {
         "kk": "Кешіріңіз, қате шықты. Қайталап көріңіз.",
         "uz": "Kechirasiz, xatolik yuz berdi. Qaytadan urinib ko'ring.",
     },
+    "too_big": {
+        "ru": "Файл слишком большой (больше 20 МБ). Пришлите, пожалуйста, фото поменьше.",
+        "kk": "Файл тым үлкен (20 МБ-тан артық). Кішірек сурет жіберіңізші.",
+        "uz": "Fayl juda katta (20 MB dan ortiq). Iltimos, kichikroq rasm yuboring.",
+    },
     "unsupported": {
         "ru": "Пожалуйста, напишите вопрос текстом, пришлите фото задачи или голосовое сообщение.",
         "kk": "Сұрақты мәтінмен жазыңыз, есептің суретін немесе дауыстық хабар жіберіңіз.",
@@ -162,12 +169,14 @@ def split_text(text: str, limit: int = 4000) -> list[str]:
     return chunks
 
 
-def clean_markdown(text: str) -> str:
-    """Убирает **жирный** и # заголовки, которые Telegram показал бы как символы."""
-    text = text.replace("**", "").replace("__", "")
-    lines = [line.lstrip("#").lstrip() if line.lstrip().startswith("#") else line
-             for line in text.splitlines()]
-    return "\n".join(lines).strip()
+async def send_pretty(message: Message, text: str, keyboard=None) -> None:
+    """Отправляет ответ с жирным текстом; если разметка сломалась — простым текстом."""
+    html_text = to_telegram_html(text)
+    try:
+        await message.answer(html_text, parse_mode="HTML", reply_markup=keyboard)
+    except TelegramBadRequest:
+        logging.warning("HTML не принят Telegram, отправляю простым текстом")
+        await message.answer(strip_html(html_text), reply_markup=keyboard)
 
 
 async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -> str:
@@ -198,7 +207,7 @@ async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -
     else:
         raise last_error  # все модели не сработали
 
-    answer = clean_markdown(response.text or "")
+    answer = latex_to_unicode(response.text or "").strip()
     if answer:
         # В историю кладём только текст (без фото/аудио), чтобы экономить память
         past.append(types.Content(role="user", parts=[types.Part.from_text(text=history_note)]))
@@ -232,10 +241,10 @@ async def answer_student(message: Message, parts: list[types.Part], history_note
     answer = answer.replace(LINKS_MARKER, "").strip()
     keyboard = links_keyboard() if show_links else None
 
-    chunks = split_text(answer)
+    chunks = split_text(answer, limit=3500)  # запас под HTML-теги
     for i, chunk in enumerate(chunks):
         is_last = i == len(chunks) - 1
-        await message.answer(chunk, reply_markup=keyboard if is_last else None)
+        await send_pretty(message, chunk, keyboard if is_last else None)
 
 
 # ---------------------------------------------------------------- команды
@@ -269,33 +278,66 @@ async def on_text(message: Message) -> None:
     await answer_student(message, [types.Part.from_text(text=text)], text)
 
 
+IMAGE_PROMPT = (
+    "Ученик прислал фото (или файл) с задачей или вопросом по физике. "
+    "Внимательно прочитай условие, включая числа, единицы и рисунок. "
+    "Если задач несколько, реши каждую по порядку. Решай по шагам: "
+    "Дано → Формула → Решение → Ответ. Если текст на фото плохо видно, "
+    "напиши, что именно не разобрал, и попроси прислать фото чётче. "
+    "Отвечай на языке подписи ученика, а если подписи нет — на языке текста на фото."
+)
+VOICE_PROMPT = (
+    "Ученик задал вопрос голосом. Внимательно послушай и пойми вопрос. "
+    "Ответь ТЕКСТОМ на том же языке, на котором он говорил (казахский, русский "
+    "или узбекский). Если это задача, реши её по шагам. Если речь неразборчива, "
+    "вежливо попроси повторить или написать текстом."
+)
+MAX_FILE_MB = 20  # Telegram позволяет боту скачивать файлы до 20 МБ
+
+
+async def answer_media(message: Message, file, mime: str, prompt: str, note: str) -> None:
+    """Скачивает фото/аудио/PDF и отправляет его в Gemini вместе с инструкцией."""
+    size = getattr(file, "file_size", 0) or 0
+    if size > MAX_FILE_MB * 1024 * 1024:
+        await message.answer(t("too_big", message))
+        return
+    try:
+        data = (await message.bot.download(file)).read()
+    except Exception:
+        logging.exception("Не удалось скачать файл")
+        await message.answer(t("error", message))
+        return
+    caption = (message.caption or "").strip()
+    text = prompt + (f"\n\nПодпись ученика: {caption}" if caption else "")
+    parts = [types.Part.from_bytes(data=data, mime_type=mime), types.Part.from_text(text=text)]
+    await answer_student(message, parts, f"{note} {caption}".strip())
+
+
 @dp.message(F.photo)
 async def on_photo(message: Message) -> None:
-    photo = await message.bot.download(message.photo[-1])  # самое большое фото
-    caption = (message.caption or "").strip()
-    prompt = caption or (
-        "Ученик прислал фото задачи или вопроса по физике. Прочитай условие, "
-        "объясни и реши по шагам. Отвечай на языке текста на фото "
-        "(казахский, русский или узбекский)."
-    )
-    parts = [
-        types.Part.from_bytes(data=photo.read(), mime_type="image/jpeg"),
-        types.Part.from_text(text=prompt),
-    ]
-    await answer_student(message, parts, f"[фото задачи] {caption}".strip())
+    await answer_media(message, message.photo[-1], "image/jpeg", IMAGE_PROMPT, "[фото задачи]")
+
+
+@dp.message(F.document)
+async def on_document(message: Message) -> None:
+    """Фото, отправленное «файлом» (без сжатия), или PDF с заданиями."""
+    doc = message.document
+    mime = (doc.mime_type or "").lower()
+    if mime.startswith("image/") or mime == "application/pdf":
+        await answer_media(message, doc, mime, IMAGE_PROMPT, "[файл с задачей]")
+    else:
+        await message.answer(t("unsupported", message))
 
 
 @dp.message(F.voice)
 async def on_voice(message: Message) -> None:
-    audio = await message.bot.download(message.voice)
-    parts = [
-        types.Part.from_bytes(data=audio.read(), mime_type="audio/ogg"),
-        types.Part.from_text(
-            text="Ученик задал вопрос голосом. Пойми вопрос и ответь текстом "
-                 "на том же языке, на котором он говорил."
-        ),
-    ]
-    await answer_student(message, parts, "[голосовой вопрос]")
+    await answer_media(message, message.voice, "audio/ogg", VOICE_PROMPT, "[голосовой вопрос]")
+
+
+@dp.message(F.audio)
+async def on_audio(message: Message) -> None:
+    mime = message.audio.mime_type or "audio/mpeg"
+    await answer_media(message, message.audio, mime, VOICE_PROMPT, "[аудио вопрос]")
 
 
 @dp.message()
