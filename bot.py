@@ -1,0 +1,263 @@
+import asyncio
+import logging
+import os
+from collections import defaultdict, deque
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiogram.utils.chat_action import ChatActionSender
+from dotenv import load_dotenv
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+
+import school_info
+from prompts import LINKS_MARKER, build_system_prompt
+
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+HISTORY_MESSAGES = 20  # сколько последних сообщений бот помнит в диалоге
+
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    raise SystemExit(
+        "Заполните TELEGRAM_BOT_TOKEN и GEMINI_API_KEY в файле .env"
+    )
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+GEN_CONFIG = types.GenerateContentConfig(
+    system_instruction=build_system_prompt(),
+    temperature=0.3,  # ниже = точнее и спокойнее
+)
+
+dp = Dispatcher()
+dp.message.filter(F.chat.type == "private")  # бот работает только в личке
+
+# История диалога каждого ученика (в памяти; сбрасывается при перезапуске)
+history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_MESSAGES))
+
+
+# ---------------------------------------------------------------- тексты
+
+TEXTS = {
+    "start": {
+        "ru": "Здравствуйте! 👋 Я помощник учителя физики.\n\n"
+              "Задайте любой вопрос по физике за 7–11 класс: объясню простым "
+              "языком с примерами, помогу решить задачу по шагам. Можно "
+              "прислать фото задачи или голосовое сообщение.\n\n"
+              "Пишите на русском, казахском или узбекском языке.\n\n"
+              "/links — курсы и ссылки\n/new — начать новый диалог",
+        "kk": "Сәлеметсіз бе! 👋 Мен физика мұғалімінің көмекшісімін.\n\n"
+              "7–11 сыныптың физикасы бойынша кез келген сұрақ қойыңыз: "
+              "қарапайым тілмен, мысалдармен түсіндіремін, есепті қадамдап "
+              "шығаруға көмектесемін. Есептің суретін немесе дауыстық хабар "
+              "жіберуге болады.\n\n"
+              "Қазақ, орыс немесе өзбек тілінде жаза беріңіз.\n\n"
+              "/links — курстар мен сілтемелер\n/new — жаңа диалог бастау",
+        "uz": "Assalomu alaykum! 👋 Men fizika o'qituvchisining yordamchisiman.\n\n"
+              "7–11-sinf fizikasi bo'yicha istalgan savol bering: oddiy tilda, "
+              "misollar bilan tushuntiraman, masalani bosqichma-bosqich "
+              "yechishga yordam beraman. Masala rasmini yoki ovozli xabar "
+              "yuborishingiz mumkin.\n\n"
+              "O'zbek, qozoq yoki rus tilida yozing.\n\n"
+              "/links — kurslar va havolalar\n/new — yangi suhbat boshlash",
+    },
+    "new": {
+        "ru": "Хорошо, начнём заново! Задайте вопрос по физике. 🙂",
+        "kk": "Жақсы, басынан бастайық! Физика бойынша сұрақ қойыңыз. 🙂",
+        "uz": "Yaxshi, qaytadan boshlaymiz! Fizika bo'yicha savol bering. 🙂",
+    },
+    "links": {
+        "ru": "Курсы, видеоуроки и соцсети учителя 👇",
+        "kk": "Мұғалімнің курстары, бейнесабақтары және әлеуметтік желілері 👇",
+        "uz": "O'qituvchining kurslari, video darslari va ijtimoiy tarmoqlari 👇",
+    },
+    "no_links": {
+        "ru": "Ссылки пока не добавлены. Скоро появятся!",
+        "kk": "Сілтемелер әзірге қосылмаған. Жақында пайда болады!",
+        "uz": "Havolalar hozircha qo'shilmagan. Tez orada paydo bo'ladi!",
+    },
+    "busy": {
+        "ru": "Сейчас много вопросов 😅 Попробуйте, пожалуйста, через минуту.",
+        "kk": "Қазір сұрақ көп 😅 Бір минуттан кейін қайталап көріңізші.",
+        "uz": "Hozir savollar ko'p 😅 Iltimos, bir daqiqadan keyin urinib ko'ring.",
+    },
+    "error": {
+        "ru": "Извините, произошла ошибка. Попробуйте ещё раз.",
+        "kk": "Кешіріңіз, қате шықты. Қайталап көріңіз.",
+        "uz": "Kechirasiz, xatolik yuz berdi. Qaytadan urinib ko'ring.",
+    },
+    "unsupported": {
+        "ru": "Пожалуйста, напишите вопрос текстом, пришлите фото задачи или голосовое сообщение.",
+        "kk": "Сұрақты мәтінмен жазыңыз, есептің суретін немесе дауыстық хабар жіберіңіз.",
+        "uz": "Iltimos, savolni matn bilan yozing, masala rasmini yoki ovozli xabar yuboring.",
+    },
+}
+
+
+def lang_of(message: Message) -> str:
+    code = (message.from_user.language_code or "").lower() if message.from_user else ""
+    if code.startswith("kk"):
+        return "kk"
+    if code.startswith("uz"):
+        return "uz"
+    return "ru"
+
+
+def t(key: str, message: Message) -> str:
+    return TEXTS[key][lang_of(message)]
+
+
+# ---------------------------------------------------------------- помощники
+
+def links_keyboard() -> InlineKeyboardMarkup | None:
+    rows = [[InlineKeyboardButton(text=label, url=url)] for label, url in school_info.links()]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def split_text(text: str, limit: int = 4000) -> list[str]:
+    """Telegram ограничивает сообщение 4096 символами — режем по строкам."""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text.strip():
+        chunks.append(text)
+    return chunks
+
+
+async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -> str:
+    """Отправляет вопрос в Gemini вместе с историей диалога."""
+    past = history[user_id]
+    contents = [*past, types.Content(role="user", parts=parts)]
+    response = await client.aio.models.generate_content(
+        model=GEMINI_MODEL, contents=contents, config=GEN_CONFIG
+    )
+    answer = (response.text or "").strip()
+    if answer:
+        # В историю кладём только текст (без фото/аудио), чтобы экономить память
+        past.append(types.Content(role="user", parts=[types.Part.from_text(text=history_note)]))
+        past.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
+    return answer
+
+
+async def answer_student(message: Message, parts: list[types.Part], history_note: str) -> None:
+    try:
+        async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+            answer = await ask_gemini(message.from_user.id, parts, history_note)
+    except genai_errors.APIError as e:
+        logging.exception("Gemini API error")
+        key = "busy" if getattr(e, "code", None) in (429, 503) else "error"
+        await message.answer(t(key, message))
+        return
+    except Exception:
+        logging.exception("Unexpected error")
+        await message.answer(t("error", message))
+        return
+
+    if not answer:
+        await message.answer(t("error", message))
+        return
+
+    show_links = LINKS_MARKER in answer
+    answer = answer.replace(LINKS_MARKER, "").strip()
+    keyboard = links_keyboard() if show_links else None
+
+    chunks = split_text(answer)
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await message.answer(chunk, reply_markup=keyboard if is_last else None)
+
+
+# ---------------------------------------------------------------- команды
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    history.pop(message.from_user.id, None)
+    await message.answer(t("start", message))
+
+
+@dp.message(Command("new"))
+async def cmd_new(message: Message) -> None:
+    history.pop(message.from_user.id, None)
+    await message.answer(t("new", message))
+
+
+@dp.message(Command("links"))
+async def cmd_links(message: Message) -> None:
+    keyboard = links_keyboard()
+    if keyboard:
+        await message.answer(t("links", message), reply_markup=keyboard)
+    else:
+        await message.answer(t("no_links", message))
+
+
+# ---------------------------------------------------------------- сообщения
+
+@dp.message(F.text)
+async def on_text(message: Message) -> None:
+    text = message.text.strip()
+    await answer_student(message, [types.Part.from_text(text=text)], text)
+
+
+@dp.message(F.photo)
+async def on_photo(message: Message) -> None:
+    photo = await message.bot.download(message.photo[-1])  # самое большое фото
+    caption = (message.caption or "").strip()
+    prompt = caption or (
+        "Ученик прислал фото задачи или вопроса по физике. Прочитай условие, "
+        "объясни и реши по шагам. Отвечай на языке текста на фото "
+        "(казахский, русский или узбекский)."
+    )
+    parts = [
+        types.Part.from_bytes(data=photo.read(), mime_type="image/jpeg"),
+        types.Part.from_text(text=prompt),
+    ]
+    await answer_student(message, parts, f"[фото задачи] {caption}".strip())
+
+
+@dp.message(F.voice)
+async def on_voice(message: Message) -> None:
+    audio = await message.bot.download(message.voice)
+    parts = [
+        types.Part.from_bytes(data=audio.read(), mime_type="audio/ogg"),
+        types.Part.from_text(
+            text="Ученик задал вопрос голосом. Пойми вопрос и ответь текстом "
+                 "на том же языке, на котором он говорил."
+        ),
+    ]
+    await answer_student(message, parts, "[голосовой вопрос]")
+
+
+@dp.message()
+async def on_other(message: Message) -> None:
+    await message.answer(t("unsupported", message))
+
+
+# ---------------------------------------------------------------- запуск
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    bot = Bot(TELEGRAM_TOKEN)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать / Бастау / Boshlash"),
+        BotCommand(command="links", description="Курсы и ссылки / Курстар / Kurslar"),
+        BotCommand(command="new", description="Новый диалог / Жаңа диалог / Yangi suhbat"),
+    ])
+    logging.info("Бот запущен. Модель: %s", GEMINI_MODEL)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
