@@ -26,7 +26,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 # Можно указать несколько моделей через запятую: если первая перегружена
 # или недоступна, бот автоматически попробует следующую.
-DEFAULT_MODELS = "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash"
+DEFAULT_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash"
+MODEL_TIMEOUT = 60  # секунд ждём одну модель, потом пробуем следующую
 GEMINI_MODELS = [
     m.strip() for m in os.getenv("GEMINI_MODEL", DEFAULT_MODELS).split(",") if m.strip()
 ]
@@ -39,7 +40,21 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
         "Заполните TELEGRAM_BOT_TOKEN и GEMINI_API_KEY в файле .env"
     )
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+def make_client() -> genai.Client:
+    # Отключаем встроенные повторы: иначе при перегрузке модели библиотека
+    # долго повторяет запрос, и бот «печатает» без ответа.
+    try:
+        http_options = types.HttpOptions(
+            timeout=MODEL_TIMEOUT * 1000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        )
+        return genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
+    except Exception:
+        logging.warning("Не удалось задать http_options, использую настройки по умолчанию")
+        return genai.Client(api_key=GEMINI_API_KEY)
+
+
+client = make_client()
 GEN_CONFIG = types.GenerateContentConfig(
     system_instruction=build_system_prompt(),
     temperature=0.3,  # ниже = точнее и спокойнее
@@ -56,20 +71,23 @@ history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_MESSAGES))
 
 TEXTS = {
     "start": {
-        "ru": "Здравствуйте! 👋 Я помощник учителя физики.\n\n"
+        "ru": "Здравствуйте! 👋 Я ассистент учителя физики "
+              "Хусанжанова Кодиржона.\n\n"
               "Задайте любой вопрос по физике за 7–11 класс: объясню простым "
               "языком с примерами, помогу решить задачу по шагам. Можно "
               "прислать фото задачи или голосовое сообщение.\n\n"
               "Пишите на русском, казахском или узбекском языке.\n\n"
               "/links — курсы и ссылки\n/new — начать новый диалог",
-        "kk": "Сәлеметсіз бе! 👋 Мен физика мұғалімінің көмекшісімін.\n\n"
+        "kk": "Сәлеметсіз бе! 👋 Мен физика пәнінің мұғалімі "
+              "Хусанжанов Кодиржонның көмекшісімін.\n\n"
               "7–11 сыныптың физикасы бойынша кез келген сұрақ қойыңыз: "
               "қарапайым тілмен, мысалдармен түсіндіремін, есепті қадамдап "
               "шығаруға көмектесемін. Есептің суретін немесе дауыстық хабар "
               "жіберуге болады.\n\n"
               "Қазақ, орыс немесе өзбек тілінде жаза беріңіз.\n\n"
               "/links — курстар мен сілтемелер\n/new — жаңа диалог бастау",
-        "uz": "Assalomu alaykum! 👋 Men fizika o'qituvchisining yordamchisiman.\n\n"
+        "uz": "Assalomu alaykum! 👋 Men fizika o'qituvchisi "
+              "Xusanjanov Qodirjonning yordamchisiman.\n\n"
               "7–11-sinf fizikasi bo'yicha istalgan savol bering: oddiy tilda, "
               "misollar bilan tushuntiraman, masalani bosqichma-bosqich "
               "yechishga yordam beraman. Masala rasmini yoki ovozli xabar "
@@ -144,6 +162,14 @@ def split_text(text: str, limit: int = 4000) -> list[str]:
     return chunks
 
 
+def clean_markdown(text: str) -> str:
+    """Убирает **жирный** и # заголовки, которые Telegram показал бы как символы."""
+    text = text.replace("**", "").replace("__", "")
+    lines = [line.lstrip("#").lstrip() if line.lstrip().startswith("#") else line
+             for line in text.splitlines()]
+    return "\n".join(lines).strip()
+
+
 async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -> str:
     """Отправляет вопрос в Gemini вместе с историей диалога."""
     past = history[user_id]
@@ -151,19 +177,28 @@ async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -
     last_error: Exception | None = None
     for model in GEMINI_MODELS:
         try:
-            response = await client.aio.models.generate_content(
-                model=model, contents=contents, config=GEN_CONFIG
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model, contents=contents, config=GEN_CONFIG
+                ),
+                timeout=MODEL_TIMEOUT,
             )
             break
+        except asyncio.TimeoutError as e:
+            last_error = e
+            logging.warning("Модель %s не ответила за %s с, пробую следующую", model, MODEL_TIMEOUT)
         except genai_errors.APIError as e:
             last_error = e
             if getattr(e, "code", None) not in FALLBACK_CODES:
                 raise
             logging.warning("Модель %s недоступна (%s), пробую следующую", model, e.code)
+        except Exception as e:  # обрыв сети, таймаут библиотеки и т.п.
+            last_error = e
+            logging.warning("Модель %s: %r, пробую следующую", model, e)
     else:
         raise last_error  # все модели не сработали
 
-    answer = (response.text or "").strip()
+    answer = clean_markdown(response.text or "")
     if answer:
         # В историю кладём только текст (без фото/аудио), чтобы экономить память
         past.append(types.Content(role="user", parts=[types.Part.from_text(text=history_note)]))
@@ -175,9 +210,13 @@ async def answer_student(message: Message, parts: list[types.Part], history_note
     try:
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             answer = await ask_gemini(message.from_user.id, parts, history_note)
+    except asyncio.TimeoutError:
+        logging.error("Ни одна модель не ответила вовремя")
+        await message.answer(t("busy", message))
+        return
     except genai_errors.APIError as e:
         logging.exception("Gemini API error")
-        key = "busy" if getattr(e, "code", None) in (429, 503) else "error"
+        key = "busy" if getattr(e, "code", None) in FALLBACK_CODES else "error"
         await message.answer(t(key, message))
         return
     except Exception:
