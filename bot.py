@@ -24,7 +24,14 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+# Можно указать несколько моделей через запятую: если первая перегружена
+# или недоступна, бот автоматически попробует следующую.
+DEFAULT_MODELS = "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash"
+GEMINI_MODELS = [
+    m.strip() for m in os.getenv("GEMINI_MODEL", DEFAULT_MODELS).split(",") if m.strip()
+]
+# Ошибки, при которых стоит попробовать другую модель
+FALLBACK_CODES = {404, 429, 500, 503}
 HISTORY_MESSAGES = 20  # сколько последних сообщений бот помнит в диалоге
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
@@ -141,9 +148,21 @@ async def ask_gemini(user_id: int, parts: list[types.Part], history_note: str) -
     """Отправляет вопрос в Gemini вместе с историей диалога."""
     past = history[user_id]
     contents = [*past, types.Content(role="user", parts=parts)]
-    response = await client.aio.models.generate_content(
-        model=GEMINI_MODEL, contents=contents, config=GEN_CONFIG
-    )
+    last_error: Exception | None = None
+    for model in GEMINI_MODELS:
+        try:
+            response = await client.aio.models.generate_content(
+                model=model, contents=contents, config=GEN_CONFIG
+            )
+            break
+        except genai_errors.APIError as e:
+            last_error = e
+            if getattr(e, "code", None) not in FALLBACK_CODES:
+                raise
+            logging.warning("Модель %s недоступна (%s), пробую следующую", model, e.code)
+    else:
+        raise last_error  # все модели не сработали
+
     answer = (response.text or "").strip()
     if answer:
         # В историю кладём только текст (без фото/аудио), чтобы экономить память
@@ -255,7 +274,7 @@ async def main() -> None:
         BotCommand(command="links", description="Курсы и ссылки / Курстар / Kurslar"),
         BotCommand(command="new", description="Новый диалог / Жаңа диалог / Yangi suhbat"),
     ])
-    logging.info("Бот запущен. Модель: %s", GEMINI_MODEL)
+    logging.info("Бот запущен. Модели: %s", ", ".join(GEMINI_MODELS))
     await dp.start_polling(bot)
 
 
